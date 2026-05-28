@@ -41,42 +41,50 @@ def yahoo_quote(symbol):
     """Fetch quote using Yahoo Finance v8 chart + v10 quoteSummary directly."""
     sym = symbol.upper()
 
-    # v8 chart endpoint — price + history
-    chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-    chart_r = SESSION.get(chart_url, params={
-        "interval": "1d", "range": "1y", "includePrePost": "false"
-    }, timeout=10)
-    chart_r.raise_for_status()
-    chart = chart_r.json()
+    # 5-day fetch for price + prev close (fast, accurate daily change)
+    r5 = SESSION.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+        params={"interval": "1d", "range": "5d", "includePrePost": "false"},
+        timeout=10
+    )
+    r5.raise_for_status()
+    d5     = r5.json()["chart"]["result"][0]
+    meta   = d5["meta"]
+    c5     = d5.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+    c5     = [c for c in c5 if c is not None]
 
-    meta   = chart["chart"]["result"][0]["meta"]
-    closes = chart["chart"]["result"][0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-    closes = [c for c in closes if c is not None]
+    # 1-year fetch for MA and RSI calculations
+    closes = c5  # fallback
+    try:
+        r1y = SESSION.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+            params={"interval": "1d", "range": "1y", "includePrePost": "false"},
+            timeout=10
+        )
+        if r1y.ok:
+            c1y    = r1y.json()["chart"]["result"][0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            closes = [c for c in c1y if c is not None]
+    except:
+        pass
 
     price = meta.get("regularMarketPrice")
 
-    # Try multiple prev-close fields in order of reliability
-    prev = (
-        meta.get("regularMarketPreviousClose") or
-        meta.get("chartPreviousClose") or
-        meta.get("previousClose")
-    )
+    # Get previous close — try meta fields first, then 5d history
+    prev = meta.get("regularMarketPreviousClose")
+    if prev is None: prev = meta.get("chartPreviousClose")
+    if prev is None: prev = meta.get("previousClose")
+    # Last resort: use second-to-last from 5d history (yesterday's close)
+    if prev is None and len(c5) >= 2:
+        prev = c5[-2]
 
-    # Try Yahoo's native change fields first, fall back to calculation
-    change     = meta.get("regularMarketChange")
-    change_pct = meta.get("regularMarketChangePercent")
-
-    if change is None or change == 0:
-        change = round(price - prev, 2) if price and prev else 0
+    # Calculate daily change from price vs prev close
+    # Never use Yahoo's change fields — they are unreliable
+    if price is not None and prev is not None and prev != 0:
+        change     = round(float(price) - float(prev), 2)
+        change_pct = round((change / float(prev)) * 100, 2)
     else:
-        change = round(float(change), 2)
-
-    if change_pct is None or change_pct == 0:
-        change_pct = round((change / prev) * 100, 2) if prev and prev != 0 else 0
-    else:
-        change_pct = round(float(change_pct), 2)
-
-    prev = prev or (round(price - change, 2) if price else None)
+        change     = 0
+        change_pct = 0
 
     # MA + RSI from history
     ma50  = round(float(pd.Series(closes).tail(50).mean()),  2) if len(closes) >= 50  else None
