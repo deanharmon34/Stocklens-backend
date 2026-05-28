@@ -5,6 +5,8 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
@@ -21,11 +23,13 @@ TICKERS = [
     "CEG","ANET","VOO","VST","NOW","IONQ","SMCI","HPE","RGTI","QBTS"
 ]
 
-FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")  # set in Railway env vars
+INDEX_TICKERS = {"S&P 500":"^GSPC","Nasdaq":"^IXIC","Dow":"^DJI","Russell":"^RUT"}
+FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
+executor      = ThreadPoolExecutor(max_workers=20)
 
+# ── Helpers ───────────────────────────────────────────────────────────
 def fmt(v, prefix=""):
-    if v is None or (isinstance(v, float) and v != v):
-        return "—"
+    if v is None or (isinstance(v, float) and v != v): return "—"
     if isinstance(v, (int, float)):
         if abs(v) >= 1e12: return f"{prefix}{v/1e12:.2f}T"
         if abs(v) >= 1e9:  return f"{prefix}{v/1e9:.2f}B"
@@ -34,144 +38,163 @@ def fmt(v, prefix=""):
     return str(v)
 
 def calc_rsi(closes, period=14):
-    """Calculate RSI from a list/series of closing prices."""
     try:
         s = pd.Series(closes)
         delta = s.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-        avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-        rs = avg_gain / avg_loss
+        gain  = delta.clip(lower=0)
+        loss  = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=period-1, min_periods=period).mean()
+        avg_loss = loss.ewm(com=period-1, min_periods=period).mean()
+        rs  = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         val = round(float(rsi.iloc[-1]), 1)
-        return val if not pd.isna(rsi.iloc[-1]) else None
+        return None if pd.isna(rsi.iloc[-1]) else val
     except:
         return None
 
-def get_news(ticker):
-    """Fetch news from Finnhub (free tier). Falls back to yfinance news."""
-    articles = []
-
-    # Try Finnhub first if key is set
-    if FINNHUB_KEY:
-        try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago}&to={today}&token={FINNHUB_KEY}"
-            r = requests.get(url, timeout=8)
-            if r.ok:
-                data = r.json()
-                for item in data[:5]:
-                    articles.append({
-                        "headline": item.get("headline", ""),
-                        "source": item.get("source", ""),
-                        "date": datetime.fromtimestamp(item.get("datetime", 0)).strftime("%b %d, %Y") if item.get("datetime") else "",
-                        "url": item.get("url", ""),
-                        "sentiment": "neu"  # Finnhub free tier doesn't include sentiment
-                    })
-        except:
-            pass
-
-    # Fallback: yfinance news
-    if not articles:
-        try:
-            t = yf.Ticker(ticker)
-            for item in (t.news or [])[:5]:
-                articles.append({
-                    "headline": item.get("title", ""),
-                    "source": item.get("publisher", ""),
-                    "date": datetime.fromtimestamp(item.get("providerPublishTime", 0)).strftime("%b %d, %Y") if item.get("providerPublishTime") else "",
-                    "url": item.get("link", ""),
-                    "sentiment": "neu"
-                })
-        except:
-            pass
-
-    return articles
-
-@app.get("/quote/{ticker}")
-def get_quote(ticker: str):
+def get_news_finnhub(ticker):
+    if not FINNHUB_KEY:
+        return []
     try:
-        sym = ticker.upper()
-        t = yf.Ticker(sym)
+        today    = datetime.now().strftime("%Y-%m-%d")
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        r = requests.get(
+            f"https://finnhub.io/api/v1/company-news",
+            params={"symbol": ticker, "from": week_ago, "to": today, "token": FINNHUB_KEY},
+            timeout=5
+        )
+        if not r.ok: return []
+        articles = []
+        for item in r.json()[:6]:
+            articles.append({
+                "headline": item.get("headline",""),
+                "source":   item.get("source",""),
+                "date":     datetime.fromtimestamp(item.get("datetime",0)).strftime("%b %d, %Y")
+                            if item.get("datetime") else "",
+                "url":      item.get("url",""),
+                "sentiment":"neu"
+            })
+        return articles
+    except:
+        return []
+
+def get_news_yfinance(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        articles = []
+        for item in (t.news or [])[:6]:
+            articles.append({
+                "headline": item.get("title",""),
+                "source":   item.get("publisher",""),
+                "date":     datetime.fromtimestamp(item.get("providerPublishTime",0)).strftime("%b %d, %Y")
+                            if item.get("providerPublishTime") else "",
+                "url":      item.get("link",""),
+                "sentiment":"neu"
+            })
+        return articles
+    except:
+        return []
+
+# ── Single ticker fetch (blocking — runs in thread pool) ──────────────
+def fetch_one(ticker):
+    try:
+        sym  = ticker.upper()
+        t    = yf.Ticker(sym)
         info = t.info
 
-        # Price data
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         prev  = info.get("previousClose") or info.get("regularMarketPreviousClose")
-        change     = round(price - prev, 2) if price and prev else 0
-        change_pct = round((change / prev) * 100, 2) if prev else 0
+        change     = round(price - prev, 2)      if price and prev else 0
+        change_pct = round((change / prev) * 100, 2) if prev      else 0
 
-        # History for MAs and RSI
-        hist = t.history(period="1y")
+        # Price history for MA + RSI (1y is enough, faster than 2y)
+        hist   = t.history(period="1y")
         closes = hist["Close"].tolist() if not hist.empty else []
-        ma50  = round(float(pd.Series(closes).tail(50).mean()), 2)  if len(closes) >= 50  else None
-        ma200 = round(float(pd.Series(closes).tail(200).mean()), 2) if len(closes) >= 200 else None
-        rsi   = calc_rsi(closes)
+        ma50   = round(float(pd.Series(closes).tail(50).mean()),  2) if len(closes) >= 50  else None
+        ma200  = round(float(pd.Series(closes).tail(200).mean()), 2) if len(closes) >= 200 else None
+        rsi    = calc_rsi(closes)
 
-        # News
-        news = get_news(sym)
+        # News — Finnhub first, yfinance fallback
+        news = get_news_finnhub(sym) or get_news_yfinance(sym)
 
         return {
-            "ticker": sym,
-            "companyName": info.get("longName") or info.get("shortName", sym),
-            "price":      round(price, 2) if price else None,
-            "change":     change,
-            "changePct":  change_pct,
-            "positive":   change >= 0,
-            "open":       info.get("open") or info.get("regularMarketOpen"),
-            "high":       info.get("dayHigh") or info.get("regularMarketDayHigh"),
-            "low":        info.get("dayLow")  or info.get("regularMarketDayLow"),
-            "prevClose":  prev,
-            "volume":     fmt(info.get("volume") or info.get("regularMarketVolume")),
-            "marketCap":  fmt(info.get("marketCap"), "$"),
-            "peRatio":    round(info.get("trailingPE"), 2)  if info.get("trailingPE")  else "—",
-            "fwdPE":      round(info.get("forwardPE"), 2)   if info.get("forwardPE")   else "—",
-            "eps":        fmt(info.get("trailingEps"), "$"),
-            "week52High": fmt(info.get("fiftyTwoWeekHigh"), "$"),
-            "week52Low":  fmt(info.get("fiftyTwoWeekLow"),  "$"),
-            "beta":       round(info.get("beta"), 2)        if info.get("beta")        else "—",
+            "ticker":        sym,
+            "companyName":   info.get("longName") or info.get("shortName", sym),
+            "price":         round(price, 2) if price else None,
+            "change":        change,
+            "changePct":     change_pct,
+            "positive":      change >= 0,
+            "open":          info.get("open") or info.get("regularMarketOpen"),
+            "high":          info.get("dayHigh") or info.get("regularMarketDayHigh"),
+            "low":           info.get("dayLow")  or info.get("regularMarketDayLow"),
+            "prevClose":     prev,
+            "volume":        fmt(info.get("volume") or info.get("regularMarketVolume")),
+            "marketCap":     fmt(info.get("marketCap"), "$"),
+            "peRatio":       round(info.get("trailingPE"), 2) if info.get("trailingPE") else "—",
+            "fwdPE":         round(info.get("forwardPE"),  2) if info.get("forwardPE")  else "—",
+            "eps":           fmt(info.get("trailingEps"), "$"),
+            "week52High":    fmt(info.get("fiftyTwoWeekHigh"), "$"),
+            "week52Low":     fmt(info.get("fiftyTwoWeekLow"),  "$"),
+            "beta":          round(info.get("beta"), 2) if info.get("beta") else "—",
             "dividendYield": f"{round(info.get('dividendYield',0)*100,2)}%" if info.get("dividendYield") else "None",
             "analystTarget": fmt(info.get("targetMeanPrice"), "$"),
-            "ma50":   ma50,
-            "ma200":  ma200,
-            "rsi":    rsi,
-            "news":   news,
+            "ma50":          ma50,
+            "ma200":         ma200,
+            "rsi":           rsi,
+            "news":          news,
         }
     except Exception as e:
         return {"ticker": ticker.upper(), "error": str(e)}
 
 
-@app.get("/quotes")
-def get_all_quotes():
-    results = {}
-    for t in TICKERS:
-        results[t] = get_quote(t)
-    # Add market indices
+def fetch_index(name, sym):
     try:
-        indices = {}
-        for name, sym in [("S&P 500","^GSPC"),("Nasdaq","^IXIC"),("Dow","^DJI"),("Russell","^RUT")]:
-            t = yf.Ticker(sym)
-            info = t.info
-            p    = info.get("regularMarketPrice") or info.get("currentPrice")
-            prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
-            chg  = round(((p-prev)/prev)*100, 2) if p and prev else 0
-            indices[name] = {
-                "name": name, "val": f"{p:,.2f}" if p else "—",
-                "chg": f"{'+' if chg>=0 else ''}{chg}%", "pos": chg >= 0
-            }
-        results["_markets"] = list(indices.values())
+        t    = yf.Ticker(sym)
+        info = t.info
+        p    = info.get("regularMarketPrice") or info.get("currentPrice")
+        prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+        chg  = round(((p - prev) / prev) * 100, 2) if p and prev else 0
+        return {"name": name, "val": f"{p:,.2f}" if p else "—",
+                "chg": f"{'+' if chg>=0 else ''}{chg}%", "pos": chg >= 0}
     except:
-        pass
+        return {"name": name, "val": "—", "chg": "—", "pos": True}
+
+
+# ── Routes ─────────────────────────────────────────────────────────────
+@app.get("/quote/{ticker}")
+async def get_quote(ticker: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, fetch_one, ticker.upper())
+
+
+@app.get("/quotes")
+async def get_all_quotes():
+    loop = asyncio.get_event_loop()
+
+    # Fetch all 30 stocks + 4 indices in parallel
+    stock_futures = [loop.run_in_executor(executor, fetch_one, t)  for t in TICKERS]
+    index_futures = [loop.run_in_executor(executor, fetch_index, name, sym)
+                     for name, sym in INDEX_TICKERS.items()]
+
+    stock_results = await asyncio.gather(*stock_futures, return_exceptions=True)
+    index_results = await asyncio.gather(*index_futures, return_exceptions=True)
+
+    results = {}
+    for t, r in zip(TICKERS, stock_results):
+        results[t] = r if not isinstance(r, Exception) else {"ticker": t, "error": str(r)}
+
+    results["_markets"] = [r for r in index_results if not isinstance(r, Exception)]
     return results
 
 
 @app.get("/news/{ticker}")
-def get_ticker_news(ticker: str):
-    return {"ticker": ticker.upper(), "news": get_news(ticker.upper())}
+async def get_ticker_news(ticker: str):
+    loop = asyncio.get_event_loop()
+    sym  = ticker.upper()
+    news = await loop.run_in_executor(executor, lambda: get_news_finnhub(sym) or get_news_yfinance(sym))
+    return {"ticker": sym, "news": news}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "finnhub": bool(FINNHUB_KEY)}
+    return {"status": "ok", "finnhub": bool(FINNHUB_KEY), "workers": 20}
