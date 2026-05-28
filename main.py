@@ -54,7 +54,8 @@ def yahoo_quote(symbol):
     closes = [c for c in closes if c is not None]
 
     price  = meta.get("regularMarketPrice")
-    prev   = meta.get("chartPreviousClose") or meta.get("previousClose")
+    # Use regularMarketPreviousClose for accurate daily change
+    prev   = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose") or meta.get("previousClose")
     change     = round(price - prev, 2)           if price and prev else 0
     change_pct = round((change / prev) * 100, 2)  if prev           else 0
 
@@ -122,6 +123,8 @@ def yahoo_quote(symbol):
         "ma200":         ma200,
         "rsi":           rsi,
         "news":          get_news(sym),
+        "dayChgPct":     change_pct,
+        "qtrChgPct":     calc_qtr_change(closes),
     }
 
 
@@ -207,6 +210,18 @@ def get_news(ticker):
         pass
 
     return []
+
+
+def calc_qtr_change(closes):
+    """Calculate % change over last ~63 trading days (1 quarter)."""
+    try:
+        if len(closes) < 63:
+            return None
+        start = closes[-63]
+        end   = closes[-1]
+        return round(((end - start) / start) * 100, 2) if start else None
+    except:
+        return None
 
 
 def fetch_one(ticker):
