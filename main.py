@@ -27,6 +27,22 @@ INDEX_TICKERS = {"S&P 500":"^GSPC","Nasdaq":"^IXIC","Dow":"^DJI","Russell":"^RUT
 FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
 executor      = ThreadPoolExecutor(max_workers=20)
 
+# Fix Yahoo Finance rate limiting — spoof browser headers
+YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+def make_ticker(sym):
+    t = yf.Ticker(sym)
+    # Inject headers into the yfinance session
+    t.session = requests.Session()
+    t.session.headers.update(YF_HEADERS)
+    return t
+
 # ── Helpers ───────────────────────────────────────────────────────────
 def fmt(v, prefix=""):
     if v is None or (isinstance(v, float) and v != v): return "—"
@@ -40,9 +56,9 @@ def fmt(v, prefix=""):
 def calc_rsi(closes, period=14):
     try:
         s = pd.Series(closes)
-        delta = s.diff()
-        gain  = delta.clip(lower=0)
-        loss  = -delta.clip(upper=0)
+        delta    = s.diff()
+        gain     = delta.clip(lower=0)
+        loss     = -delta.clip(upper=0)
         avg_gain = gain.ewm(com=period-1, min_periods=period).mean()
         avg_loss = loss.ewm(com=period-1, min_periods=period).mean()
         rs  = avg_gain / avg_loss
@@ -59,7 +75,7 @@ def get_news_finnhub(ticker):
         today    = datetime.now().strftime("%Y-%m-%d")
         week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         r = requests.get(
-            f"https://finnhub.io/api/v1/company-news",
+            "https://finnhub.io/api/v1/company-news",
             params={"symbol": ticker, "from": week_ago, "to": today, "token": FINNHUB_KEY},
             timeout=5
         )
@@ -67,12 +83,12 @@ def get_news_finnhub(ticker):
         articles = []
         for item in r.json()[:6]:
             articles.append({
-                "headline": item.get("headline",""),
-                "source":   item.get("source",""),
-                "date":     datetime.fromtimestamp(item.get("datetime",0)).strftime("%b %d, %Y")
+                "headline": item.get("headline", ""),
+                "source":   item.get("source", ""),
+                "date":     datetime.fromtimestamp(item.get("datetime", 0)).strftime("%b %d, %Y")
                             if item.get("datetime") else "",
-                "url":      item.get("url",""),
-                "sentiment":"neu"
+                "url":      item.get("url", ""),
+                "sentiment": "neu"
             })
         return articles
     except:
@@ -80,41 +96,42 @@ def get_news_finnhub(ticker):
 
 def get_news_yfinance(ticker):
     try:
-        t = yf.Ticker(ticker)
+        t = make_ticker(ticker)
         articles = []
         for item in (t.news or [])[:6]:
             articles.append({
-                "headline": item.get("title",""),
-                "source":   item.get("publisher",""),
-                "date":     datetime.fromtimestamp(item.get("providerPublishTime",0)).strftime("%b %d, %Y")
+                "headline": item.get("title", ""),
+                "source":   item.get("publisher", ""),
+                "date":     datetime.fromtimestamp(item.get("providerPublishTime", 0)).strftime("%b %d, %Y")
                             if item.get("providerPublishTime") else "",
-                "url":      item.get("link",""),
-                "sentiment":"neu"
+                "url":      item.get("link", ""),
+                "sentiment": "neu"
             })
         return articles
     except:
         return []
 
-# ── Single ticker fetch (blocking — runs in thread pool) ──────────────
+# ── Single ticker fetch ───────────────────────────────────────────────
 def fetch_one(ticker):
     try:
         sym  = ticker.upper()
-        t    = yf.Ticker(sym)
+        t    = make_ticker(sym)
         info = t.info
+
+        if not info or len(info) < 5:
+            raise ValueError("Empty info returned — Yahoo may be rate limiting")
 
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         prev  = info.get("previousClose") or info.get("regularMarketPreviousClose")
-        change     = round(price - prev, 2)      if price and prev else 0
-        change_pct = round((change / prev) * 100, 2) if prev      else 0
+        change     = round(price - prev, 2)           if price and prev else 0
+        change_pct = round((change / prev) * 100, 2)  if prev           else 0
 
-        # Price history for MA + RSI (1y is enough, faster than 2y)
         hist   = t.history(period="1y")
         closes = hist["Close"].tolist() if not hist.empty else []
         ma50   = round(float(pd.Series(closes).tail(50).mean()),  2) if len(closes) >= 50  else None
         ma200  = round(float(pd.Series(closes).tail(200).mean()), 2) if len(closes) >= 200 else None
         rsi    = calc_rsi(closes)
 
-        # News — Finnhub first, yfinance fallback
         news = get_news_finnhub(sym) or get_news_yfinance(sym)
 
         return {
@@ -149,7 +166,7 @@ def fetch_one(ticker):
 
 def fetch_index(name, sym):
     try:
-        t    = yf.Ticker(sym)
+        t    = make_ticker(sym)
         info = t.info
         p    = info.get("regularMarketPrice") or info.get("currentPrice")
         prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
@@ -171,8 +188,7 @@ async def get_quote(ticker: str):
 async def get_all_quotes():
     loop = asyncio.get_event_loop()
 
-    # Fetch all 30 stocks + 4 indices in parallel
-    stock_futures = [loop.run_in_executor(executor, fetch_one, t)  for t in TICKERS]
+    stock_futures = [loop.run_in_executor(executor, fetch_one, t) for t in TICKERS]
     index_futures = [loop.run_in_executor(executor, fetch_index, name, sym)
                      for name, sym in INDEX_TICKERS.items()]
 
@@ -185,14 +201,6 @@ async def get_all_quotes():
 
     results["_markets"] = [r for r in index_results if not isinstance(r, Exception)]
     return results
-
-
-@app.get("/news/{ticker}")
-async def get_ticker_news(ticker: str):
-    loop = asyncio.get_event_loop()
-    sym  = ticker.upper()
-    news = await loop.run_in_executor(executor, lambda: get_news_finnhub(sym) or get_news_yfinance(sym))
-    return {"ticker": sym, "news": news}
 
 
 @app.get("/health")
