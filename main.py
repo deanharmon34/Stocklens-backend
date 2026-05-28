@@ -21,7 +21,7 @@ app.add_middleware(
 TICKERS = [
     "MU","AVGO","MRVL","AMD","NVDA","ASML","DELL","TSM","CRWD","VRT",
     "ARM","GEV","ALAB","QQQ","MSFT","AAPL","AMZN","PLTR","ORCL","ETN",
-    "CEG","ANET","VOO","VST","NOW","IONQ","SMCI","HPE","RGTI","QBTS"
+    "CEG","ANET","VOO","VST","NOW","IONQ","SMCI","HPE","RGTI","QBTS","HGRAF"
 ]
 INDEX_TICKERS = {"S&P 500":"^GSPC","Nasdaq":"^IXIC","Dow":"^DJI","Russell":"^RUT"}
 FINNHUB_KEY   = os.getenv("FINNHUB_KEY", "")
