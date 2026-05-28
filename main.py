@@ -53,13 +53,30 @@ def yahoo_quote(symbol):
     closes = chart["chart"]["result"][0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
     closes = [c for c in closes if c is not None]
 
-    price  = meta.get("regularMarketPrice")
-    # Yahoo provides these directly — most accurate daily change
-    change     = meta.get("regularMarketChange") or 0
-    change_pct = meta.get("regularMarketChangePercent") or 0
-    change     = round(float(change), 2)
-    change_pct = round(float(change_pct), 2)
-    prev       = round(price - change, 2) if price else None
+    price = meta.get("regularMarketPrice")
+
+    # Try multiple prev-close fields in order of reliability
+    prev = (
+        meta.get("regularMarketPreviousClose") or
+        meta.get("chartPreviousClose") or
+        meta.get("previousClose")
+    )
+
+    # Try Yahoo's native change fields first, fall back to calculation
+    change     = meta.get("regularMarketChange")
+    change_pct = meta.get("regularMarketChangePercent")
+
+    if change is None or change == 0:
+        change = round(price - prev, 2) if price and prev else 0
+    else:
+        change = round(float(change), 2)
+
+    if change_pct is None or change_pct == 0:
+        change_pct = round((change / prev) * 100, 2) if prev and prev != 0 else 0
+    else:
+        change_pct = round(float(change_pct), 2)
+
+    prev = prev or (round(price - change, 2) if price else None)
 
     # MA + RSI from history
     ma50  = round(float(pd.Series(closes).tail(50).mean()),  2) if len(closes) >= 50  else None
@@ -265,7 +282,6 @@ async def get_all_quotes():
 
 @app.get("/health")
 def health():
-    # Quick test of Yahoo API
     try:
         r = SESSION.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/AAPL",
@@ -273,15 +289,31 @@ def health():
             timeout=5
         )
         yahoo_ok = r.ok
-        price    = r.json()["chart"]["result"][0]["meta"].get("regularMarketPrice")
-    except:
-        yahoo_ok = False
-        price    = None
+        meta     = r.json()["chart"]["result"][0]["meta"]
+        price    = meta.get("regularMarketPrice")
+        prev     = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose") or meta.get("previousClose")
+        chg      = meta.get("regularMarketChange")
+        chg_pct  = meta.get("regularMarketChangePercent")
+        # Show which fields are available for debugging
+        available = [k for k in ["regularMarketPreviousClose","chartPreviousClose",
+                                  "regularMarketChange","regularMarketChangePercent"]
+                     if meta.get(k) is not None]
+    except Exception as e:
+        yahoo_ok  = False
+        price     = None
+        prev      = None
+        chg       = None
+        chg_pct   = None
+        available = []
 
     return {
-        "status":   "ok",
-        "finnhub":  bool(FINNHUB_KEY),
-        "yahoo_ok": yahoo_ok,
+        "status":    "ok",
+        "finnhub":   bool(FINNHUB_KEY),
+        "yahoo_ok":  yahoo_ok,
         "aapl_price": price,
-        "workers":  20
+        "aapl_prev":  prev,
+        "aapl_chg":   chg,
+        "aapl_chg_pct": chg_pct,
+        "available_fields": available,
+        "workers":   20
     }
