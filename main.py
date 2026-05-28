@@ -41,10 +41,10 @@ def yahoo_quote(symbol):
     """Fetch quote using Yahoo Finance v8 chart + v10 quoteSummary directly."""
     sym = symbol.upper()
 
-    # 5-day fetch for price + prev close (fast, accurate daily change)
+    # 2-day fetch — gives exactly [yesterday_close, today_close]
     r5 = SESSION.get(
         f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
-        params={"interval": "1d", "range": "5d", "includePrePost": "false"},
+        params={"interval": "1d", "range": "2d", "includePrePost": "false"},
         timeout=10
     )
     r5.raise_for_status()
@@ -293,11 +293,13 @@ def health():
     try:
         r = SESSION.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/AAPL",
-            params={"interval":"1d","range":"5d"},
+            params={"interval":"1d","range":"2d"},
             timeout=5
         )
         yahoo_ok = r.ok
-        meta     = r.json()["chart"]["result"][0]["meta"]
+        data     = r.json()["chart"]["result"][0]
+        meta     = data["meta"]
+        closes_2d = [c for c in data.get("indicators",{}).get("quote",[{}])[0].get("close",[]) if c is not None]
         price    = meta.get("regularMarketPrice")
         prev     = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose") or meta.get("previousClose")
         chg      = meta.get("regularMarketChange")
@@ -315,13 +317,14 @@ def health():
         available = []
 
     return {
-        "status":    "ok",
-        "finnhub":   bool(FINNHUB_KEY),
-        "yahoo_ok":  yahoo_ok,
-        "aapl_price": price,
-        "aapl_prev":  prev,
-        "aapl_chg":   chg,
+        "status":       "ok",
+        "finnhub":      bool(FINNHUB_KEY),
+        "yahoo_ok":     yahoo_ok,
+        "aapl_price":   price,
+        "aapl_prev":    prev,
+        "aapl_chg":     chg,
         "aapl_chg_pct": chg_pct,
+        "closes_2d":    closes_2d if 'closes_2d' in dir() else [],
         "available_fields": available,
-        "workers":   20
+        "workers":      20
     }
