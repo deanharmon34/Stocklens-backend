@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
-import json
+import pandas as pd
+import requests
+from datetime import datetime, timedelta
+import os
 
 app = FastAPI()
 
@@ -13,67 +16,131 @@ app.add_middleware(
 )
 
 TICKERS = [
-    "MU", "AVGO", "MRVL", "NVDA", "DELL", "TSM", "CRWD", "VRT",
-    "ARM", "GEV", "ALAB", "QQQ", "MSFT", "PLTR", "ETN", "ANET",
-    "VOO", "NOW", "IONQ", "SMCI"
+    "MU","AVGO","MRVL","AMD","NVDA","ASML","DELL","TSM","CRWD","VRT",
+    "ARM","GEV","ALAB","QQQ","MSFT","AAPL","AMZN","PLTR","ORCL","ETN",
+    "CEG","ANET","VOO","VST","NOW","IONQ","SMCI","HPE","RGTI","QBTS"
 ]
 
+FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")  # set in Railway env vars
+
 def fmt(v, prefix=""):
-    if v is None or v != v:  # NaN check
+    if v is None or (isinstance(v, float) and v != v):
         return "—"
-    if isinstance(v, float) or isinstance(v, int):
+    if isinstance(v, (int, float)):
         if abs(v) >= 1e12: return f"{prefix}{v/1e12:.2f}T"
         if abs(v) >= 1e9:  return f"{prefix}{v/1e9:.2f}B"
         if abs(v) >= 1e6:  return f"{prefix}{v/1e6:.2f}M"
         return f"{prefix}{v:,.2f}"
     return str(v)
 
+def calc_rsi(closes, period=14):
+    """Calculate RSI from a list/series of closing prices."""
+    try:
+        s = pd.Series(closes)
+        delta = s.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+        avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        val = round(float(rsi.iloc[-1]), 1)
+        return val if not pd.isna(rsi.iloc[-1]) else None
+    except:
+        return None
+
+def get_news(ticker):
+    """Fetch news from Finnhub (free tier). Falls back to yfinance news."""
+    articles = []
+
+    # Try Finnhub first if key is set
+    if FINNHUB_KEY:
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago}&to={today}&token={FINNHUB_KEY}"
+            r = requests.get(url, timeout=8)
+            if r.ok:
+                data = r.json()
+                for item in data[:5]:
+                    articles.append({
+                        "headline": item.get("headline", ""),
+                        "source": item.get("source", ""),
+                        "date": datetime.fromtimestamp(item.get("datetime", 0)).strftime("%b %d, %Y") if item.get("datetime") else "",
+                        "url": item.get("url", ""),
+                        "sentiment": "neu"  # Finnhub free tier doesn't include sentiment
+                    })
+        except:
+            pass
+
+    # Fallback: yfinance news
+    if not articles:
+        try:
+            t = yf.Ticker(ticker)
+            for item in (t.news or [])[:5]:
+                articles.append({
+                    "headline": item.get("title", ""),
+                    "source": item.get("publisher", ""),
+                    "date": datetime.fromtimestamp(item.get("providerPublishTime", 0)).strftime("%b %d, %Y") if item.get("providerPublishTime") else "",
+                    "url": item.get("link", ""),
+                    "sentiment": "neu"
+                })
+        except:
+            pass
+
+    return articles
+
 @app.get("/quote/{ticker}")
 def get_quote(ticker: str):
     try:
-        t = yf.Ticker(ticker.upper())
+        sym = ticker.upper()
+        t = yf.Ticker(sym)
         info = t.info
-        hist = t.history(period="1d")
-        
-        price = info.get("currentPrice") or info.get("regularMarketPrice") or (hist["Close"].iloc[-1] if not hist.empty else None)
-        prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
-        
-        change = round(price - prev, 2) if price and prev else 0
+
+        # Price data
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        prev  = info.get("previousClose") or info.get("regularMarketPreviousClose")
+        change     = round(price - prev, 2) if price and prev else 0
         change_pct = round((change / prev) * 100, 2) if prev else 0
-        
-        # Moving averages from history
-        hist_1y = t.history(period="1y")
-        ma50  = round(hist_1y["Close"].tail(50).mean(), 2)  if len(hist_1y) >= 50  else None
-        ma200 = round(hist_1y["Close"].tail(200).mean(), 2) if len(hist_1y) >= 200 else None
+
+        # History for MAs and RSI
+        hist = t.history(period="1y")
+        closes = hist["Close"].tolist() if not hist.empty else []
+        ma50  = round(float(pd.Series(closes).tail(50).mean()), 2)  if len(closes) >= 50  else None
+        ma200 = round(float(pd.Series(closes).tail(200).mean()), 2) if len(closes) >= 200 else None
+        rsi   = calc_rsi(closes)
+
+        # News
+        news = get_news(sym)
 
         return {
-            "ticker": ticker.upper(),
-            "companyName": info.get("longName") or info.get("shortName", ticker),
-            "price": round(price, 2) if price else None,
-            "change": change,
-            "changePct": change_pct,
-            "positive": change >= 0,
-            "open": info.get("open") or info.get("regularMarketOpen"),
-            "high": info.get("dayHigh") or info.get("regularMarketDayHigh"),
-            "low":  info.get("dayLow")  or info.get("regularMarketDayLow"),
-            "prevClose": prev,
-            "volume": fmt(info.get("volume") or info.get("regularMarketVolume")),
-            "marketCap": fmt(info.get("marketCap"), "$"),
-            "peRatio": round(info.get("trailingPE"), 2) if info.get("trailingPE") else "—",
-            "fwdPE":   round(info.get("forwardPE"),  2) if info.get("forwardPE")  else "—",
-            "eps": fmt(info.get("trailingEps"), "$"),
+            "ticker": sym,
+            "companyName": info.get("longName") or info.get("shortName", sym),
+            "price":      round(price, 2) if price else None,
+            "change":     change,
+            "changePct":  change_pct,
+            "positive":   change >= 0,
+            "open":       info.get("open") or info.get("regularMarketOpen"),
+            "high":       info.get("dayHigh") or info.get("regularMarketDayHigh"),
+            "low":        info.get("dayLow")  or info.get("regularMarketDayLow"),
+            "prevClose":  prev,
+            "volume":     fmt(info.get("volume") or info.get("regularMarketVolume")),
+            "marketCap":  fmt(info.get("marketCap"), "$"),
+            "peRatio":    round(info.get("trailingPE"), 2)  if info.get("trailingPE")  else "—",
+            "fwdPE":      round(info.get("forwardPE"), 2)   if info.get("forwardPE")   else "—",
+            "eps":        fmt(info.get("trailingEps"), "$"),
             "week52High": fmt(info.get("fiftyTwoWeekHigh"), "$"),
             "week52Low":  fmt(info.get("fiftyTwoWeekLow"),  "$"),
-            "beta": round(info.get("beta"), 2) if info.get("beta") else "—",
+            "beta":       round(info.get("beta"), 2)        if info.get("beta")        else "—",
             "dividendYield": f"{round(info.get('dividendYield',0)*100,2)}%" if info.get("dividendYield") else "None",
             "analystTarget": fmt(info.get("targetMeanPrice"), "$"),
-            "ma50":  ma50,
-            "ma200": ma200,
-            "fiftyDayAverage":     info.get("fiftyDayAverage"),
-            "twoHundredDayAverage": info.get("twoHundredDayAverage"),
+            "ma50":   ma50,
+            "ma200":  ma200,
+            "rsi":    rsi,
+            "news":   news,
         }
     except Exception as e:
-        return {"ticker": ticker, "error": str(e)}
+        return {"ticker": ticker.upper(), "error": str(e)}
 
 
 @app.get("/quotes")
@@ -81,9 +148,30 @@ def get_all_quotes():
     results = {}
     for t in TICKERS:
         results[t] = get_quote(t)
+    # Add market indices
+    try:
+        indices = {}
+        for name, sym in [("S&P 500","^GSPC"),("Nasdaq","^IXIC"),("Dow","^DJI"),("Russell","^RUT")]:
+            t = yf.Ticker(sym)
+            info = t.info
+            p    = info.get("regularMarketPrice") or info.get("currentPrice")
+            prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+            chg  = round(((p-prev)/prev)*100, 2) if p and prev else 0
+            indices[name] = {
+                "name": name, "val": f"{p:,.2f}" if p else "—",
+                "chg": f"{'+' if chg>=0 else ''}{chg}%", "pos": chg >= 0
+            }
+        results["_markets"] = list(indices.values())
+    except:
+        pass
     return results
+
+
+@app.get("/news/{ticker}")
+def get_ticker_news(ticker: str):
+    return {"ticker": ticker.upper(), "news": get_news(ticker.upper())}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "finnhub": bool(FINNHUB_KEY)}
