@@ -54,10 +54,12 @@ def yahoo_quote(symbol):
     closes = [c for c in closes if c is not None]
 
     price  = meta.get("regularMarketPrice")
-    # Use regularMarketPreviousClose for accurate daily change
-    prev   = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose") or meta.get("previousClose")
-    change     = round(price - prev, 2)           if price and prev else 0
-    change_pct = round((change / prev) * 100, 2)  if prev           else 0
+    # Yahoo provides these directly — most accurate daily change
+    change     = meta.get("regularMarketChange") or 0
+    change_pct = meta.get("regularMarketChangePercent") or 0
+    change     = round(float(change), 2)
+    change_pct = round(float(change_pct), 2)
+    prev       = round(price - change, 2) if price else None
 
     # MA + RSI from history
     ma50  = round(float(pd.Series(closes).tail(50).mean()),  2) if len(closes) >= 50  else None
