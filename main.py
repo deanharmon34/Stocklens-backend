@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pandas as pd
@@ -237,6 +237,61 @@ async def get_all_quotes():
         results[t] = r if not isinstance(r, Exception) else {"ticker":t,"error":str(r)}
     results["_markets"] = [r for r in ir if not isinstance(r, Exception)]
     return results
+
+import json, pathlib
+
+PORTFOLIO_FILE = pathlib.Path("/tmp/portfolios.json")
+
+def load_portfolios():
+    try:
+        if PORTFOLIO_FILE.exists():
+            return json.loads(PORTFOLIO_FILE.read_text())
+    except: pass
+    return {}
+
+def save_portfolios(data):
+    try:
+        PORTFOLIO_FILE.write_text(json.dumps(data))
+        return True
+    except:
+        return False
+
+@app.get("/portfolios")
+def get_portfolios():
+    return load_portfolios()
+
+@app.post("/portfolios")
+async def set_portfolios(request: Request):
+    try:
+        body = await request.json()
+        save_portfolios(body)
+        return {"status":"ok"}
+    except Exception as e:
+        return {"status":"error","message":str(e)}
+
+@app.get("/portfolios/{name}")
+def get_portfolio(name: str):
+    all_p = load_portfolios()
+    return all_p.get(name, {})
+
+@app.put("/portfolios/{name}")
+async def save_portfolio(name: str, request: Request):
+    try:
+        body = await request.json()
+        all_p = load_portfolios()
+        all_p[name] = body
+        save_portfolios(all_p)
+        return {"status":"ok","name":name}
+    except Exception as e:
+        return {"status":"error","message":str(e)}
+
+@app.delete("/portfolios/{name}")
+def delete_portfolio(name: str):
+    all_p = load_portfolios()
+    if name in all_p:
+        del all_p[name]
+        save_portfolios(all_p)
+    return {"status":"ok"}
 
 @app.get("/health")
 def health():
