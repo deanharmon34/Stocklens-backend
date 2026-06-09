@@ -120,60 +120,58 @@ def fetch_one(ticker):
         vol_p   = fmt(meta.get("regularMarketVolume"))
         name    = meta.get("longName") or meta.get("shortName") or sym
 
-        # ── Fundamentals via Yahoo query2 API ───────────────────────
+        # ── Fundamentals via Finnhub (works from server IPs) ────────
         pe=fwdpe=eps_p=w52h=w52l=beta_p=mktcap=target_p = "—"
         divy_p = "None"
 
-        def gv(d, *keys):
-            for k in keys:
-                v = d.get(k)
-                if v is not None:
-                    if isinstance(v, dict): v = v.get("raw")
-                    if v is not None:
-                        try: return float(v)
-                        except: pass
-            return None
+        # 52W high/low from v8 chart meta (always available)
+        w52h_v = meta.get("fiftyTwoWeekHigh")
+        w52l_v = meta.get("fiftyTwoWeekLow")
+        if w52h_v: w52h = f"${float(w52h_v):,.2f}"
+        if w52l_v: w52l = f"${float(w52l_v):,.2f}"
 
-        try:
-            r_q2 = SESSION.get(
-                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}",
-                params={"modules":"summaryDetail,defaultKeyStatistics,financialData,price"},
-                timeout=8
-            )
-            if r_q2.ok:
-                res  = r_q2.json()["quoteSummary"]["result"][0]
-                sd   = res.get("summaryDetail",{})
-                ks   = res.get("defaultKeyStatistics",{})
-                fd   = res.get("financialData",{})
-                pr   = res.get("price",{})
-                pe_v    = gv(sd,"trailingPE") or gv(pr,"trailingPE")
-                fwdpe_v = gv(sd,"forwardPE")  or gv(pr,"forwardPE")
-                eps_v   = gv(ks,"trailingEps")
-                w52h_v  = gv(sd,"fiftyTwoWeekHigh")
-                w52l_v  = gv(sd,"fiftyTwoWeekLow")
-                beta_v  = gv(sd,"beta")
-                mc_v    = gv(pr,"marketCap") or gv(sd,"marketCap")
-                dy_v    = gv(sd,"dividendYield") or gv(sd,"trailingAnnualDividendYield")
-                tgt_v   = gv(fd,"targetMeanPrice")
-                vol_v   = gv(pr,"regularMarketVolume")
-                nm      = pr.get("longName") or pr.get("shortName")
-                if isinstance(nm, dict): nm = nm.get("raw","")
-                if nm and nm != sym: name = str(nm)
-                if pe_v:     pe       = f"{pe_v:.2f}x"
-                if fwdpe_v:  fwdpe    = f"{fwdpe_v:.2f}x"
-                if eps_v:    eps_p    = f"${eps_v:.2f}"
-                if w52h_v:   w52h     = f"${w52h_v:,.2f}"
-                if w52l_v:   w52l     = f"${w52l_v:,.2f}"
-                if beta_v:   beta_p   = f"{beta_v:.2f}"
-                if mc_v:     mktcap   = fmt(mc_v,"$")
-                if dy_v:     divy_p   = f"{round(dy_v*100,2)}%"
-                if tgt_v:    target_p = f"${tgt_v:,.2f}"
-                if vol_v and vol_p == "—": vol_p = fmt(vol_v)
-        except:
-            pass
-        # Fallback to v8 meta for 52W range
-        if w52h == "—": w52h = fmt(meta.get("fiftyTwoWeekHigh"),"$")
-        if w52l == "—": w52l = fmt(meta.get("fiftyTwoWeekLow"), "$")
+        if FINNHUB_KEY:
+            try:
+                # Finnhub basic financials — PE, EPS, beta, market cap, dividend
+                r_fin = requests.get("https://finnhub.io/api/v1/stock/metric",
+                    params={"symbol":sym,"metric":"all","token":FINNHUB_KEY},timeout=6)
+                if r_fin.ok:
+                    m = r_fin.json().get("metric",{})
+                    pe_v    = m.get("peBasicExclExtraTTM") or m.get("peNormalizedAnnual")
+                    eps_v   = m.get("epsBasicExclExtraAnnual") or m.get("epsTTM")
+                    beta_v  = m.get("beta")
+                    mc_v    = m.get("marketCapitalization")  # in millions
+                    dy_v    = m.get("dividendYieldIndicatedAnnual")
+                    w52h_f  = m.get("52WeekHigh")
+                    w52l_f  = m.get("52WeekLow")
+                    if pe_v:   pe      = f"{float(pe_v):.2f}x"
+                    if eps_v:  eps_p   = f"${float(eps_v):.2f}"
+                    if beta_v: beta_p  = f"{float(beta_v):.2f}"
+                    if mc_v:   mktcap  = fmt(float(mc_v)*1e6,"$")
+                    if dy_v:   divy_p  = f"{round(float(dy_v),2)}%"
+                    if w52h_f and w52h=="—": w52h = f"${float(w52h_f):,.2f}"
+                    if w52l_f and w52l=="—": w52l = f"${float(w52l_f):,.2f}"
+            except: pass
+            try:
+                # Finnhub price target
+                r_tgt = requests.get("https://finnhub.io/api/v1/stock/price-target",
+                    params={"symbol":sym,"token":FINNHUB_KEY},timeout=5)
+                if r_tgt.ok:
+                    d = r_tgt.json()
+                    t = d.get("targetMean") or d.get("targetMedian")
+                    if t: target_p = f"${float(t):,.2f}"
+            except: pass
+            try:
+                # Finnhub company profile for name + market cap
+                r_prof = requests.get("https://finnhub.io/api/v1/stock/profile2",
+                    params={"symbol":sym,"token":FINNHUB_KEY},timeout=5)
+                if r_prof.ok:
+                    d = r_prof.json()
+                    nm = d.get("name")
+                    if nm and nm != sym: name = nm
+                    mc2 = d.get("marketCapitalization")
+                    if mc2 and mktcap=="—": mktcap = fmt(float(mc2)*1e6,"$")
+            except: pass
 
         # ── 1-year chart: MA + RSI ───────────────────────────────────
         closes = c2
@@ -251,14 +249,14 @@ def health():
         chg   = round(((price-prev)/prev)*100,2) if price and prev else 0
         pe = mktcap = None
         try:
-            rq = SESSION.get("https://query2.finance.yahoo.com/v10/finance/quoteSummary/AAPL",
-                params={"modules":"summaryDetail,price"},timeout=5)
-            if rq.ok:
-                res = rq.json()["quoteSummary"]["result"][0]
-                sd  = res.get("summaryDetail",{})
-                pr  = res.get("price",{})
-                pe_r  = sd.get("trailingPE");  pe     = pe_r.get("raw")  if isinstance(pe_r,dict)  else pe_r
-                mc_r  = pr.get("marketCap");   mktcap = mc_r.get("raw")  if isinstance(mc_r,dict)  else mc_r
+            if FINNHUB_KEY:
+                rq = requests.get("https://finnhub.io/api/v1/stock/metric",
+                    params={"symbol":"AAPL","metric":"all","token":FINNHUB_KEY},timeout=5)
+                if rq.ok:
+                    m  = rq.json().get("metric",{})
+                    pe = m.get("peBasicExclExtraTTM")
+                    mc = m.get("marketCapitalization")
+                    mktcap = f"${float(mc)*1e6/1e12:.2f}T" if mc else None
         except: pass
     except Exception as e:
         return {"status":"ok","yahoo_ok":False,"finnhub":bool(FINNHUB_KEY),"error":str(e)}
